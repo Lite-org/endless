@@ -2,248 +2,325 @@ package endless
 
 import (
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
-	"os/signal"
-	"runtime"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
-
-	// "github.com/fvbock/uds-go/introspect"
 )
+
+// State represents the current state of Server
+type State uint8
 
 const (
-	PRE_SIGNAL = iota
-	POST_SIGNAL
+	// StateInit is the state of server when its created.
+	StateInit State = iota
 
-	STATE_INIT
-	STATE_RUNNING
-	STATE_SHUTTING_DOWN
-	STATE_TERMINATE
+	// StateRunning is the state of server when its running.
+	StateRunning
+
+	// StateShuttingDown is the state of server when it is shutting down.
+	StateShuttingDown
+
+	// StateShutdown is the state of server when it has shutdown.
+	StateShutdown
+
+	// StateTerminated is the state of server if it was forcibly terminated.
+	StateTerminated
+
+	// StateFailed is the state of server if failed unexpectedly.
+	StateFailed
 )
 
+func (s State) String() string {
+	switch s {
+	case StateInit:
+		return "init"
+	case StateRunning:
+		return "running"
+	case StateShuttingDown:
+		return "shutting down"
+	case StateShutdown:
+		return "shutdown"
+	case StateTerminated:
+		return "terminated"
+	default:
+		return fmt.Sprintf("state(%d)", s)
+	}
+}
+
+// InvalidStateError is the error type returned if an invalid state transition is attempted.
+type InvalidStateError struct {
+	CurrentState   State
+	RequestedState State
+}
+
+func (err *InvalidStateError) Error() string {
+	return fmt.Sprintf("invalid state transition from %v to %v", err.CurrentState, err.RequestedState)
+}
+
+// Default values used on server creation.
 var (
-	runningServerReg     sync.RWMutex
-	runningServers       map[string]*endlessServer
-	runningServersOrder  []string
-	socketPtrOffsetMap   map[string]uint
-	runningServersForked bool
+	// DefaultReadTimeout is the default value assigned to ReadTimeout of Servers.
+	DefaultReadTimeout time.Duration
 
-	DefaultReadTimeOut    time.Duration
-	DefaultWriteTimeOut   time.Duration
+	// DefaultWriteTimeout is the default value assigned to WriteTimeout of Servers.
+	DefaultWriteTimeout time.Duration
+
+	// DefaultMaxHeaderBytes is the default value assigned to MaxHeaderBytes of Servers.
 	DefaultMaxHeaderBytes int
-	DefaultHammerTime     time.Duration
 
-	isChild     bool
-	socketOrder string
-
-	hookableSignals []os.Signal
+	// DefaultTerminateTimeout is the default value assigned to TerminateTimeout of Servers.
+	DefaultTerminateTimeout = 60 * time.Second
 )
 
-func init() {
-	runningServerReg = sync.RWMutex{}
-	runningServers = make(map[string]*endlessServer)
-	runningServersOrder = []string{}
-	socketPtrOffsetMap = make(map[string]uint)
-
-	DefaultMaxHeaderBytes = 0 // use http.DefaultMaxHeaderBytes - which currently is 1 << 20 (1MB)
-
-	// after a restart the parent will finish ongoing requests before
-	// shutting down. set to a negative value to disable
-	DefaultHammerTime = 60 * time.Second
-
-	hookableSignals = []os.Signal{
-		syscall.SIGHUP,
-		syscall.SIGUSR1,
-		syscall.SIGUSR2,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGTSTP,
-	}
+// Handler is the interface that objects implement to perform operations on a endless Servers.
+type Handler interface {
+	Handle(*Manager)
+	Stop()
 }
 
-type endlessServer struct {
+// Server represents a endless server.
+type Server struct {
 	http.Server
-	EndlessListener  net.Listener
-	SignalHooks      map[int]map[os.Signal][]func()
-	tlsInnerListener *endlessListener
+	state            State
+	listener         net.Listener
+	endlessListener  *Listener
 	wg               sync.WaitGroup
-	sigChan          chan os.Signal
-	isChild          bool
-	state            uint8
-	lock             *sync.RWMutex
 	BeforeBegin      func(add string)
+	mtx              sync.RWMutex
+	TerminateTimeout time.Duration
+	Done             chan struct{}
+	Debug            bool
+	Net              string
 }
 
-/*
-NewServer returns an intialized endlessServer Object. Calling Serve on it will
-actually "start" the server.
-*/
-func NewServer(addr string, handler http.Handler) (srv *endlessServer) {
-	runningServerReg.Lock()
-	defer runningServerReg.Unlock()
-
-	socketOrder = os.Getenv("ENDLESS_SOCKET_ORDER")
-	isChild = os.Getenv("ENDLESS_CONTINUE") != ""
-
-	if len(socketOrder) > 0 {
-		for i, addr := range strings.Split(socketOrder, ",") {
-			socketPtrOffsetMap[addr] = uint(i)
-		}
-	} else {
-		socketPtrOffsetMap[addr] = uint(len(runningServersOrder))
-	}
-
-	srv = &endlessServer{
-		wg:      sync.WaitGroup{},
-		sigChan: make(chan os.Signal),
-		isChild: isChild,
-		SignalHooks: map[int]map[os.Signal][]func(){
-			PRE_SIGNAL: map[os.Signal][]func(){
-				syscall.SIGHUP:  []func(){},
-				syscall.SIGUSR1: []func(){},
-				syscall.SIGUSR2: []func(){},
-				syscall.SIGINT:  []func(){},
-				syscall.SIGTERM: []func(){},
-				syscall.SIGTSTP: []func(){},
-			},
-			POST_SIGNAL: map[os.Signal][]func(){
-				syscall.SIGHUP:  []func(){},
-				syscall.SIGUSR1: []func(){},
-				syscall.SIGUSR2: []func(){},
-				syscall.SIGINT:  []func(){},
-				syscall.SIGTERM: []func(){},
-				syscall.SIGTSTP: []func(){},
-			},
-		},
-		state: STATE_INIT,
-		lock:  &sync.RWMutex{},
+// NewServer returns an initialized Server Object. Calling Serve on it will
+// actually "start" the server.
+func NewServer(net, addr string, handler http.Handler) (srv *Server) {
+	srv = &Server{
+		Done: make(chan struct{}),
+		Net:  net,
 	}
 
 	srv.Server.Addr = addr
-	srv.Server.ReadTimeout = DefaultReadTimeOut
-	srv.Server.WriteTimeout = DefaultWriteTimeOut
+	srv.Server.ReadTimeout = DefaultReadTimeout
+	srv.Server.WriteTimeout = DefaultWriteTimeout
 	srv.Server.MaxHeaderBytes = DefaultMaxHeaderBytes
 	srv.Server.Handler = handler
+	srv.TerminateTimeout = DefaultTerminateTimeout
 
 	srv.BeforeBegin = func(addr string) {
-		log.Println(syscall.Getpid(), addr)
+		srv.Debugln(syscall.Getpid(), addr)
 	}
 
-	runningServersOrder = append(runningServersOrder, addr)
-	runningServers[addr] = srv
+	mgr.Register(srv)
 
 	return
 }
 
-/*
-ListenAndServe listens on the TCP network address addr and then calls Serve
-with handler to handle requests on incoming connections. Handler is typically
-nil, in which case the DefaultServeMux is used.
-*/
+// AddressKey returns the unique address key for the server.
+func (srv *Server) AddressKey() string {
+	return srv.Net + ":" + srv.Addr
+}
+
+// Printf calls Printf on ErrorLog if not nil otherwise it calls log.Printf.
+func (srv *Server) Printf(format string, v ...interface{}) {
+	if srv.ErrorLog != nil {
+		srv.ErrorLog.Printf(format, v...)
+	} else {
+		log.Printf(format, v...)
+	}
+}
+
+// Println calls Println on ErrorLog if not nil otherwise it calls log.Println.
+func (srv *Server) Println(v ...interface{}) {
+	if srv.ErrorLog != nil {
+		srv.ErrorLog.Println(v...)
+	} else {
+		log.Println(v...)
+	}
+}
+
+// Debugln calls Println with the current pid prepended if Debug is true
+func (srv *Server) Debugln(v ...interface{}) {
+	if srv.Debug {
+		srv.Println(append([]interface{}{syscall.Getpid()}, v...))
+	}
+}
+
+// ListenAndServe listens on the TCP network address addr and then calls Serve
+// with handler to handle requests on incoming connections. Handler is typically
+// nil, in which case the DefaultServeMux is used.
 func ListenAndServe(addr string, handler http.Handler) error {
-	server := NewServer(addr, handler)
+	server := NewServer("tcp", addr, handler)
 	return server.ListenAndServe()
 }
 
-/*
-ListenAndServeTLS acts identically to ListenAndServe, except that it expects
-HTTPS connections. Additionally, files containing a certificate and matching
-private key for the server must be provided. If the certificate is signed by a
-certificate authority, the certFile should be the concatenation of the server's
-certificate followed by the CA's certificate.
-*/
+// ListenAndServeTLS acts identically to ListenAndServe, except that it expects
+// HTTPS connections. Additionally, files containing a certificate and matching
+// private key for the server must be provided. If the certificate is signed by a
+// certificate authority, the certFile should be the concatenation of the server's
+// certificate followed by the CA's certificate.
 func ListenAndServeTLS(addr string, certFile string, keyFile string, handler http.Handler) error {
-	server := NewServer(addr, handler)
+	server := NewServer("tcp", addr, handler)
 	return server.ListenAndServeTLS(certFile, keyFile)
 }
 
-func (srv *endlessServer) getState() uint8 {
-	srv.lock.RLock()
-	defer srv.lock.RUnlock()
+// GetState returns the current state of the server.
+func (srv *Server) GetState() State {
+	srv.mtx.RLock()
+	defer srv.mtx.RUnlock()
 
 	return srv.state
 }
 
-func (srv *endlessServer) setState(st uint8) {
-	srv.lock.Lock()
-	defer srv.lock.Unlock()
+// invalidState returns an invalid state with the RequestedState set to req.
+func (srv *Server) invalidState(req State) error {
+	return &InvalidStateError{CurrentState: srv.state, RequestedState: req}
+}
+
+// setState updates the current state of the server to st.
+// If its not valid to transition from the current state to st then and
+// InvalidStateError is returned.
+func (srv *Server) setState(st State) error {
+	if st == srv.state {
+		return nil
+	}
+
+	switch {
+	case st == StateInit && srv.state != StateInit:
+		return srv.invalidState(st)
+	case st == StateRunning && srv.state != StateInit:
+		return srv.invalidState(st)
+	case st == StateShuttingDown && srv.state != StateRunning:
+		return srv.invalidState(st)
+	case st == StateShutdown:
+		switch srv.state {
+		case StateShuttingDown:
+			// Nothing
+		case StateFailed, StateTerminated:
+			return nil
+		default:
+			return srv.invalidState(st)
+		}
+	case st == StateTerminated:
+		if srv.state != StateShuttingDown {
+			return srv.invalidState(st)
+		}
+	case st == StateFailed:
+		switch srv.state {
+		case StateTerminated, StateShutdown:
+			return srv.invalidState(st)
+		}
+	}
+
+	switch st {
+	case StateTerminated, StateFailed, StateShutdown:
+		// Final state
+		mgr.Unregister(srv)
+		if srv.listener != nil {
+			srv.listener.Close()
+		}
+		close(srv.Done)
+	}
 
 	srv.state = st
+
+	return nil
 }
 
-/*
-Serve accepts incoming HTTP connections on the listener l, creating a new
-service goroutine for each. The service goroutines read requests and then call
-handler to reply to them. Handler is typically nil, in which case the
-DefaultServeMux is used.
+// Serve accepts incoming HTTP connections on the Listener l, creating a new
+// service goroutine for each. The service goroutines read requests and then call
+// handler to reply to them. Handler is typically nil, in which case the
+// DefaultServeMux is used.
+//
+// In addition to the standard library Serve behaviour each connection is added to a
+// sync.Waitgroup so that all outstanding connections can be served before shutting
+// down the server.
+func (srv *Server) Serve() error {
+	srv.mtx.Lock()
+	defer srv.mtx.Unlock()
 
-In addition to the stl Serve behaviour each connection is added to a
-sync.Waitgroup so that all outstanding connections can be served before shutting
-down the server.
-*/
-func (srv *endlessServer) Serve() (err error) {
-	defer log.Println(syscall.Getpid(), "Serve() returning...")
-	srv.setState(STATE_RUNNING)
-	err = srv.Server.Serve(srv.EndlessListener)
-	log.Println(syscall.Getpid(), "Waiting for connections to finish...")
+	return srv.serveLocked()
+}
+
+func (srv *Server) serveLocked() error {
+	if err := srv.setState(StateRunning); err != nil {
+		return err
+	}
+
+	// Drop the lock while we're actually in serve or waiting for connections
+	// to complete.
+	srv.mtx.Unlock()
+
+	defer srv.Debugln(syscall.Getpid(), "Serve() returning...")
+
+	err := srv.Server.Serve(srv.listener)
+	srv.Debugln(syscall.Getpid(), "Waiting for connections to finish...")
 	srv.wg.Wait()
-	srv.setState(STATE_TERMINATE)
-	return
+
+	srv.Debugln(syscall.Getpid(), "Connections finished")
+
+	// Reobtain the lock while we manipulate state, ensuring that callers
+	// unlock is successfull.
+	srv.mtx.Lock()
+	if err != nil && srv.state == StateRunning {
+		// Unexpected error as we're still meant to be running
+		srv.setState(StateFailed)
+		return err
+	}
+	return srv.setState(StateShutdown)
 }
 
-/*
-ListenAndServe listens on the TCP network address srv.Addr and then calls Serve
-to handle requests on incoming connections. If srv.Addr is blank, ":http" is
-used.
-*/
-func (srv *endlessServer) ListenAndServe() (err error) {
-	addr := srv.Addr
-	if addr == "" {
-		addr = ":http"
+// ListenAndServe listens on the TCP network address srv.Addr and then calls Serve
+// to handle requests on incoming connections. If srv.Addr is blank, ":http" is
+// used.
+func (srv *Server) ListenAndServe() error {
+	srv.mtx.Lock()
+	defer srv.mtx.Unlock()
+
+	if srv.Addr == "" {
+		srv.Addr = ":http"
 	}
 
-	go srv.handleSignals()
-
-	l, err := srv.getListener(addr)
+	l, err := mgr.Listen(srv)
 	if err != nil {
-		log.Println(err)
-		return
+		srv.setState(StateFailed)
+		return err
 	}
 
-	srv.EndlessListener = newEndlessListener(l, srv)
+	srv.endlessListener = NewListener(l, srv)
+	srv.listener = srv.endlessListener
 
-	if srv.isChild {
-		syscall.Kill(syscall.Getppid(), syscall.SIGTERM)
+	if err = mgr.serverListening(); err != nil {
+		srv.setState(StateFailed)
+		return err
 	}
 
 	srv.BeforeBegin(srv.Addr)
 
-	return srv.Serve()
+	return srv.serveLocked()
 }
 
-/*
-ListenAndServeTLS listens on the TCP network address srv.Addr and then calls
-Serve to handle requests on incoming TLS connections.
+// ListenAndServeTLS listens on the TCP network address srv.Addr and then calls
+// Serve to handle requests on incoming TLS connections.
+//
+// Filenames containing a certificate and matching private key for the server must
+// be provided. If the certificate is signed by a certificate authority, the
+// certFile should be the concatenation of the server's certificate followed by the
+// CA's certificate.
+//
+// If srv.Addr is blank, ":https" is used.
+func (srv *Server) ListenAndServeTLS(certFile, keyFile string) (err error) {
+	srv.mtx.Lock()
+	defer srv.mtx.Unlock()
 
-Filenames containing a certificate and matching private key for the server must
-be provided. If the certificate is signed by a certificate authority, the
-certFile should be the concatenation of the server's certificate followed by the
-CA's certificate.
-
-If srv.Addr is blank, ":https" is used.
-*/
-func (srv *endlessServer) ListenAndServeTLS(certFile, keyFile string) (err error) {
-	addr := srv.Addr
-	if addr == "" {
-		addr = ":https"
+	if srv.Addr == "" {
+		srv.Addr = ":https"
 	}
 
 	config := &tls.Config{}
@@ -257,307 +334,194 @@ func (srv *endlessServer) ListenAndServeTLS(certFile, keyFile string) (err error
 	config.Certificates = make([]tls.Certificate, 1)
 	config.Certificates[0], err = tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
+		srv.setState(StateFailed)
 		return
 	}
 
-	go srv.handleSignals()
-
-	l, err := srv.getListener(addr)
+	var l net.Listener
+	l, err = mgr.Listen(srv)
 	if err != nil {
-		log.Println(err)
+		srv.setState(StateFailed)
 		return
 	}
 
-	srv.tlsInnerListener = newEndlessListener(l, srv)
-	srv.EndlessListener = tls.NewListener(srv.tlsInnerListener, config)
+	srv.endlessListener = NewListener(l, srv)
+	srv.listener = tls.NewListener(srv.endlessListener, config)
 
-	if srv.isChild {
-		syscall.Kill(syscall.Getppid(), syscall.SIGTERM)
+	if err = mgr.serverListening(); err != nil {
+		srv.setState(StateFailed)
+		return err
 	}
 
-	log.Println(syscall.Getpid(), srv.Addr)
-	return srv.Serve()
+	srv.BeforeBegin(srv.Addr)
+
+	return srv.serveLocked()
 }
 
-/*
-getListener either opens a new socket to listen on, or takes the acceptor socket
-it got passed when restarted.
-*/
-func (srv *endlessServer) getListener(laddr string) (l net.Listener, err error) {
-	if srv.isChild {
-		var ptrOffset uint = 0
-		runningServerReg.RLock()
-		defer runningServerReg.RUnlock()
-		if len(socketPtrOffsetMap) > 0 {
-			ptrOffset = socketPtrOffsetMap[laddr]
-			// log.Println("laddr", laddr, "ptr offset", socketPtrOffsetMap[laddr])
-		}
+// Shutdown closes the Listener so that no new connections are accepted. it also
+// starts a goroutine that will terminate (stop all running requests) the server
+// after TerminateTimeout.
+func (srv *Server) Shutdown() error {
+	srv.mtx.Lock()
+	defer srv.mtx.Unlock()
 
-		f := os.NewFile(uintptr(3+ptrOffset), "")
-		l, err = net.FileListener(f)
-		if err != nil {
-			err = fmt.Errorf("net.FileListener error: %v", err)
-			return
-		}
-	} else {
-		l, err = net.Listen("tcp", laddr)
-		if err != nil {
-			err = fmt.Errorf("net.Listen error: %v", err)
-			return
-		}
-	}
-	return
-}
-
-/*
-handleSignals listens for os Signals and calls any hooked in function that the
-user had registered with the signal.
-*/
-func (srv *endlessServer) handleSignals() {
-	var sig os.Signal
-
-	signal.Notify(
-		srv.sigChan,
-		hookableSignals...,
-	)
-
-	pid := syscall.Getpid()
-	for {
-		sig = <-srv.sigChan
-		srv.signalHooks(PRE_SIGNAL, sig)
-		switch sig {
-		case syscall.SIGHUP:
-			log.Println(pid, "Received SIGHUP. forking.")
-			err := srv.fork()
-			if err != nil {
-				log.Println("Fork err:", err)
-			}
-		case syscall.SIGUSR1:
-			log.Println(pid, "Received SIGUSR1.")
-		case syscall.SIGUSR2:
-			log.Println(pid, "Received SIGUSR2.")
-			srv.hammerTime(0 * time.Second)
-		case syscall.SIGINT:
-			log.Println(pid, "Received SIGINT.")
-			srv.shutdown()
-		case syscall.SIGTERM:
-			log.Println(pid, "Received SIGTERM.")
-			srv.shutdown()
-		case syscall.SIGTSTP:
-			log.Println(pid, "Received SIGTSTP.")
-		default:
-			log.Printf("Received %v: nothing i care about...\n", sig)
-		}
-		srv.signalHooks(POST_SIGNAL, sig)
-	}
-}
-
-func (srv *endlessServer) signalHooks(ppFlag int, sig os.Signal) {
-	if _, notSet := srv.SignalHooks[ppFlag][sig]; !notSet {
-		return
-	}
-	for _, f := range srv.SignalHooks[ppFlag][sig] {
-		f()
-	}
-	return
-}
-
-/*
-shutdown closes the listener so that no new connections are accepted. it also
-starts a goroutine that will hammer (stop all running requests) the server
-after DefaultHammerTime.
-*/
-func (srv *endlessServer) shutdown() {
-	if srv.getState() != STATE_RUNNING {
-		return
+	switch srv.state {
+	case StateShuttingDown, StateShutdown, StateTerminated, StateFailed:
+		// No action needed
+		return nil
 	}
 
-	srv.setState(STATE_SHUTTING_DOWN)
-	if DefaultHammerTime >= 0 {
-		go srv.hammerTime(DefaultHammerTime)
-	}
-	// disable keep-alives on existing connections
-	srv.SetKeepAlivesEnabled(false)
-	err := srv.EndlessListener.Close()
-	if err != nil {
-		log.Println(syscall.Getpid(), "Listener.Close() error:", err)
-	} else {
-		log.Println(syscall.Getpid(), srv.EndlessListener.Addr(), "Listener closed.")
-	}
-}
-
-/*
-hammerTime forces the server to shutdown in a given timeout - whether it
-finished outstanding requests or not. if Read/WriteTimeout are not set or the
-max header size is very big a connection could hang...
-
-srv.Serve() will not return until all connections are served. this will
-unblock the srv.wg.Wait() in Serve() thus causing ListenAndServe(TLS) to
-return.
-*/
-func (srv *endlessServer) hammerTime(d time.Duration) {
-	defer func() {
-		// we are calling srv.wg.Done() until it panics which means we called
-		// Done() when the counter was already at 0 and we're done.
-		// (and thus Serve() will return and the parent will exit)
-		if r := recover(); r != nil {
-			log.Println("WaitGroup at 0", r)
-		}
-	}()
-	if srv.getState() != STATE_SHUTTING_DOWN {
-		return
-	}
-	time.Sleep(d)
-	log.Println("[STOP - Hammer Time] Forcefully shutting down parent")
-	for {
-		if srv.getState() == STATE_TERMINATE {
-			break
-		}
-		srv.wg.Done()
-		runtime.Gosched()
-	}
-}
-
-func (srv *endlessServer) fork() (err error) {
-	runningServerReg.Lock()
-	defer runningServerReg.Unlock()
-
-	// only one server instance should fork!
-	if runningServersForked {
-		return errors.New("Another process already forked. Ignoring this one.")
+	if err := srv.setState(StateShuttingDown); err != nil {
+		return err
 	}
 
-	runningServersForked = true
-
-	var files = make([]*os.File, len(runningServers))
-	var orderArgs = make([]string, len(runningServers))
-	// get the accessor socket fds for _all_ server instances
-	for _, srvPtr := range runningServers {
-		// introspect.PrintTypeDump(srvPtr.EndlessListener)
-		switch srvPtr.EndlessListener.(type) {
-		case *endlessListener:
-			// normal listener
-			files[socketPtrOffsetMap[srvPtr.Server.Addr]] = srvPtr.EndlessListener.(*endlessListener).File()
-		default:
-			// tls listener
-			files[socketPtrOffsetMap[srvPtr.Server.Addr]] = srvPtr.tlsInnerListener.File()
-		}
-		orderArgs[socketPtrOffsetMap[srvPtr.Server.Addr]] = srvPtr.Server.Addr
+	err := srv.listener.Close()
+	if srv.TerminateTimeout >= 0 {
+		go srv.Terminate(srv.TerminateTimeout)
 	}
 
-	env := append(
-		os.Environ(),
-		"ENDLESS_CONTINUE=1",
-	)
-	if len(runningServers) > 1 {
-		env = append(env, fmt.Sprintf(`ENDLESS_SOCKET_ORDER=%s`, strings.Join(orderArgs, ",")))
-	}
-
-	// log.Println(files)
-	path := os.Args[0]
-	var args []string
-	if len(os.Args) > 1 {
-		args = os.Args[1:]
-	}
-
-	cmd := exec.Command(path, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.ExtraFiles = files
-	cmd.Env = env
-
-	// cmd.SysProcAttr = &syscall.SysProcAttr{
-	// 	Setsid:  true,
-	// 	Setctty: true,
-	// 	Ctty:    ,
-	// }
-
-	err = cmd.Start()
-	if err != nil {
-		log.Fatalf("Restart: Failed to launch, error: %v", err)
-	}
-
-	return
-}
-
-type endlessListener struct {
-	net.Listener
-	stopped bool
-	server  *endlessServer
-}
-
-func (el *endlessListener) Accept() (c net.Conn, err error) {
-	tc, err := el.Listener.(*net.TCPListener).AcceptTCP()
-	if err != nil {
-		return
-	}
-
-	tc.SetKeepAlive(true)                  // see http.tcpKeepAliveListener
-	tc.SetKeepAlivePeriod(3 * time.Minute) // see http.tcpKeepAliveListener
-
-	c = endlessConn{
-		Conn:   tc,
-		server: el.server,
-	}
-
-	el.server.wg.Add(1)
-	return
-}
-
-func newEndlessListener(l net.Listener, srv *endlessServer) (el *endlessListener) {
-	el = &endlessListener{
-		Listener: l,
-		server:   srv,
-	}
-
-	return
-}
-
-func (el *endlessListener) Close() error {
-	if el.stopped {
-		return syscall.EINVAL
-	}
-
-	el.stopped = true
-	return el.Listener.Close()
-}
-
-func (el *endlessListener) File() *os.File {
-	// returns a dup(2) - FD_CLOEXEC flag *not* set
-	tl := el.Listener.(*net.TCPListener)
-	fl, _ := tl.File()
-	return fl
-}
-
-type endlessConn struct {
-	net.Conn
-	server *endlessServer
-}
-
-func (w endlessConn) Close() error {
-	err := w.Conn.Close()
-	if err == nil {
-		w.server.wg.Done()
-	}
 	return err
 }
 
-/*
-RegisterSignalHook registers a function to be run PRE_SIGNAL or POST_SIGNAL for
-a given signal. PRE or POST in this case means before or after the signal
-related code endless itself runs
-*/
-func (srv *endlessServer) RegisterSignalHook(prePost int, sig os.Signal, f func()) (err error) {
-	if prePost != PRE_SIGNAL && prePost != POST_SIGNAL {
-		err = fmt.Errorf("Cannot use %v for prePost arg. Must be endless.PRE_SIGNAL or endless.POST_SIGNAL.", sig)
-		return
+// Terminate forces the server to shutdown in a given timeout - whether it
+// finished outstanding requests or not. if Read/WriteTimeout are not set or the
+// max header size is very big a connection could hang...
+//
+// srv.Serve() will not return until all connections are served. this will
+// unblock the srv.wg.Wait() in Serve() thus causing ListenAndServe(TLS) to
+// return.
+func (srv *Server) Terminate(d time.Duration) error {
+	srv.mtx.Lock()
+
+	if srv.state != StateShuttingDown {
+		srv.mtx.Unlock()
+		return srv.invalidState(StateTerminated)
 	}
-	for _, s := range hookableSignals {
-		if s == sig {
-			srv.SignalHooks[prePost][sig] = append(srv.SignalHooks[prePost][sig], f)
-			return
-		}
+
+	// Drop the lock while we wait
+	srv.mtx.Unlock()
+
+	select {
+	case <-time.After(d):
+	case <-srv.Done:
+		// Shutdown succeeded in grace period
+		return nil
 	}
-	err = fmt.Errorf("Signal %v is not supported.", sig)
-	return
+
+	// Check Shutdown really didn't succeed as select is random
+	select {
+	case <-srv.Done:
+		// Shutdown succeeded in grace period
+		return nil
+	default:
+	}
+	srv.mtx.Lock()
+	defer srv.mtx.Unlock()
+
+	srv.endlessListener.Terminate()
+
+
+	return srv.setState(StateTerminated)
+}
+
+// Listener represents an endless listener.
+type Listener struct {
+	net.Listener
+	mtx    sync.Mutex
+	server *Server
+	conns  map[*conn]struct{}
+}
+
+// Terminate closes all active connections accepted by the listener.
+func (el *Listener) Terminate() {
+	el.mtx.Lock()
+	defer el.mtx.Unlock()
+
+	for c := range el.conns {
+		el.closeConnLocked(c)
+	}
+}
+
+// Accept implements the Accept method in the Listener interface; it waits
+// for the next call and returns a generic Conn.
+func (el *Listener) Accept() (net.Conn, error) {
+	c, err := el.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	wc := &conn{
+		Conn:     c,
+		listener: el,
+	}
+
+	el.mtx.Lock()
+	defer el.mtx.Unlock()
+
+	el.conns[wc] = struct{}{}
+	el.server.wg.Add(1)
+
+	return wc, nil
+}
+
+// closeConn closes a connection removing it from the active connections list and notifies the server its done.
+func (el *Listener) closeConn(c *conn) error {
+	el.mtx.Lock()
+	defer el.mtx.Unlock()
+
+	return el.closeConnLocked(c)
+}
+
+func (el *Listener) closeConnLocked(c *conn) error {
+	if c.closed {
+		// Already closed
+		return nil
+	}
+
+	delete(el.conns, c)
+	el.server.wg.Done()
+	c.closed = true
+
+	return c.Conn.Close()
+}
+
+// ErrUnsupportedListener is the error returned when the Listener doesn't support a File method.
+type ErrUnsupportedListener struct {
+	net.Listener
+}
+
+func (e *ErrUnsupportedListener) Error() string {
+	return fmt.Sprintf("%T", e.Listener)
+}
+
+// NewListener creates a new Listener.
+func NewListener(l net.Listener, srv *Server) *Listener {
+	return &Listener{
+		Listener: l,
+		server:   srv,
+		conns:    make(map[*conn]struct{}),
+	}
+}
+
+type listenerFile interface {
+	File() (*os.File, error)
+}
+
+// File returns an os.File duplicated from the listener.
+func (el *Listener) File() (*os.File, error) {
+	// returns a dup(2) - FD_CLOEXEC flag *not* set
+	if t, ok := el.Listener.(listenerFile); ok {
+		return t.File()
+	}
+	return nil, &ErrUnsupportedListener{el.Listener}
+}
+
+type conn struct {
+	net.Conn
+	listener *Listener
+	closed   bool
+}
+
+func (c *conn) Close() error {
+	return c.listener.closeConn(c)
 }
